@@ -88,8 +88,7 @@ if st.button("find my answer"):
             st.chat_message("user").write(question)
 
             st_cb=StreamlitCallbackHandler(st.container(),expand_new_thoughts=False)
-            response=assistant_agent.run(st.session_state.messages,callbacks=[st_cb]
-                                         )
+            response=assistant_agent.run(question, callbacks=[st_cb])
             st.session_state.messages.append({'role':'assistant',"content":response})
             st.write('### Response:')
             st.success(response)
