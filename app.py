@@ -3,9 +3,8 @@ from langchain_groq import ChatGroq
 from langchain.chains import LLMMathChain, LLMChain
 from langchain.prompts import PromptTemplate
 from langchain_community.utilities import WikipediaAPIWrapper
-from langchain.agents.agent_types import AgentType
-from langchain.agents import Tool, initialize_agent
-# FIX: Use the community package to avoid deployment deprecation crashes
+from langchain.agents import Tool, create_tool_calling_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.callbacks import StreamlitCallbackHandler
 
 ## Set up the Streamlit app
@@ -18,10 +17,10 @@ if not groq_api_key:
     st.info("Please add your Groq API key to continue")
     st.stop()
 
-# 1. Main conversational LLM
+# 1. Main tool-calling LLM
 llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key)
 
-# 2. FIX: Create a dedicated math LLM with 0 temperature to stop conversational formatting
+# 2. Strict math engine
 llm_math_engine = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key, temperature=0.0)
 
 ## Initializing the tools
@@ -29,45 +28,48 @@ wikipedia_wrapper = WikipediaAPIWrapper()
 wikipedia_tool = Tool(
     name="Wikipedia",
     func=wikipedia_wrapper.run,
-    description="A tool for searching the Internet to find various information on the topics mentioned."
+    description="Useful for searching the Internet to find general information on non-mathematical topics."
 )
 
-## FIX: Initialize the Math tool using the strict, non-chatty math engine
 math_chain = LLMMathChain.from_llm(llm=llm_math_engine)
 calculator = Tool(
     name="Calculator",
     func=math_chain.run,
-    description="A tool for answering math-related questions. Only raw mathematical expressions should be passed to this tool (e.g., (5-2)+(7-3))."
+    description="Useful for evaluating explicit mathematical or arithmetic calculations expressions (e.g. 8 - 2)."
 )
 
-prompt = """
-You are an agent tasked with solving a user's mathematical question. Logically arrive at the solution, provide a detailed explanation,
-and display it point-wise.
+# Structured Reasoning Prompt to prevent tool confusion loops
+prompt_text = """
+You are a reasoning model. Break down the logic step-by-step to answer the query.
 Question: {question}
 Answer:
 """
-
-prompt_template = PromptTemplate(
-    input_variables=["question"],
-    template=prompt
-)
-
-## Combine all the tools into chain
+prompt_template = PromptTemplate(input_variables=["question"], template=prompt_text)
 chain = LLMChain(llm=llm, prompt=prompt_template)
 
 reasoning_tool = Tool(
-    name="Reasoning tool",
+    name="Reasoning_Tool",
     func=chain.run,
-    description="A tool for answering logic-based and reasoning questions."
+    description="Useful for breaking down word problems, logical riddles, and multi-step text math questions before calculating."
 )
 
-## initialize the agents
-assistant_agent = initialize_agent(
-    tools=[wikipedia_tool, calculator, reasoning_tool],
-    llm=llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-    verbose=False,
-    handle_parsing_errors=True
+tools = [wikipedia_tool, calculator, reasoning_tool]
+
+# 3. Modern Tool Calling Prompt Design
+agent_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant equipped with specialized tools. Always use the most specific tool available to solve the user's problem. Once you obtain the final answer from a tool, provide it directly to the user."),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+# 4. Initialize Modern Native Tool Calling Agent
+agent = create_tool_calling_agent(llm, tools, agent_prompt)
+assistant_agent = AgentExecutor(
+    agent=agent, 
+    tools=tools, 
+    verbose=True, 
+    handle_parsing_errors=True,
+    max_iterations=5 # Safety fallback boundary
 )
 
 if "messages" not in st.session_state:
@@ -78,10 +80,10 @@ if "messages" not in st.session_state:
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg['content'])
 
-## Let's start the interaction
+## Interaction Input UI
 question = st.text_area(
     "Enter your question:",
-    value="I have 5 bananas and 7 grapes. I eat 2 bananas and give away 3 grapes. Then I buy a dozen apples and 2 packs of blueberries. Each pack of blueberries contains 25 berries. How many total pieces of fruit do I have at the end?"
+    value="If I have 8 bananas and 2 I have given to someone then how much are left with me"
 )
 
 if st.button("Find my answer"):
@@ -90,9 +92,11 @@ if st.button("Find my answer"):
             st.session_state.messages.append({"role": "user", "content": question})
             st.chat_message("user").write(question)
 
-            # FIX: StreamlitCallbackHandler container mapping
             st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
-            response = assistant_agent.run(question, callbacks=[st_cb])
+            
+            # Execute with modern agent format
+            response_obj = assistant_agent.invoke({"input": question}, callbacks=[st_cb])
+            response = response_obj["output"]
             
             st.session_state.messages.append({'role': 'assistant', "content": response})
             st.write('### Response:')
