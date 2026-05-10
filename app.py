@@ -1,9 +1,10 @@
 import streamlit as st
+import json
 from langchain_groq import ChatGroq
-from langchain.chains import LLMMathChain, LLMChain
+from langchain.chains import LLMMathChain
 from langchain.prompts import PromptTemplate
 from langchain_community.utilities import WikipediaAPIWrapper
-from langchain.agents import Tool, initialize_agent, AgentType
+from langchain.agents import Tool
 from langchain_community.callbacks import StreamlitCallbackHandler
 
 ## Set up the Streamlit app
@@ -16,56 +17,42 @@ if not groq_api_key:
     st.info("Please add your Groq API key to continue")
     st.stop()
 
-# 1. Initialize models with zero-temperature fallback to enforce deterministic tool routing
-llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key, temperature=0.0)
+# 1. Core LLM Clients
+llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key)
+llm_math_engine = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key, temperature=0.0)
 
-## Initializing the tools
+## Initializing the Tools
 wikipedia_wrapper = WikipediaAPIWrapper()
 wikipedia_tool = Tool(
     name="Wikipedia",
     func=wikipedia_wrapper.run,
-    description="Useful for searching the Internet to find general information on non-mathematical topics."
+    description="For searching general information on historical, geographical, or non-mathematical topics."
 )
 
-# 2. Fix the LLMMathChain output format conflict natively using an explicit internal prompt override
 custom_math_prompt = PromptTemplate(
     input_variables=["question"],
-    template=(
-        "Translate this math problem into a clean Python expression that runs with the numexpr library. "
-        "Do not write text, introductions, markdown or explanations. Return ONLY the code format required.\n"
-        "Question: {question}\n"
-        "```python\n"
-    )
+    template="Translate to a pure Python numeric expression for numexpr. No text.\nQuestion: {question}\n```python\n"
 )
-
-math_chain = LLMMathChain.from_llm(llm=llm, prompt=custom_math_prompt)
+math_chain = LLMMathChain.from_llm(llm=llm_math_engine, prompt=custom_math_prompt)
 calculator = Tool(
     name="Calculator",
     func=math_chain.run,
-    description="Useful for evaluating arithmetic, numeric or equations expressions. Pass only raw expressions (e.g. 8-2)."
+    description="For executing raw arithmetic math formulas or expressions (e.g. 8-2, 12*25)."
 )
 
-# 3. Create a logic block to isolate word problems from simple tool execution loops
-prompt_text = "Solve this multi-step logic text reasoning query clearly step-by-step: {question}"
-prompt_template = PromptTemplate(input_variables=["question"], template=prompt_text)
-chain = LLMChain(llm=llm, prompt=prompt_template)
-
-reasoning_tool = Tool(
-    name="Reasoning_Tool",
-    func=chain.run,
-    description="Useful for breaking down raw textual word math problems, counting scenarios, or logic questions."
-)
-
-tools = [wikipedia_tool, calculator, reasoning_tool]
-
-# 4. Use STRUCTURED_CHAT agent type to prevent standard text loop parsing errors in LangChain 0.1.14
-assistant_agent = initialize_agent(
-    tools=tools,
-    llm=llm,
-    agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
-    verbose=True,
-    handle_parsing_errors=True,
-    max_iterations=5  # Strict iteration fallback boundary
+# 2. Strict Router Prompt Configuration
+router_prompt = PromptTemplate(
+    input_variables=["question"],
+    template=(
+        "You are an routing agent. Analyze the question and select the single best tool to use.\n"
+        "Available tools:\n"
+        "- 'Calculator': If the question requires executing explicit math formulas, arithmetic equations, or numeric calculations.\n"
+        "- 'Wikipedia': If the question requires looking up factual real-world definitions or historical events.\n"
+        "- 'Direct': If the question can be answered with simple logic or direct context without tools.\n\n"
+        "Return ONLY a clean valid JSON object with keys 'tool' and 'input'. Do not include markdown code blocks or explanations.\n"
+        "Example output: {{\n  \"tool\": \"Calculator\",\n  \"input\": \"8 - 2\"\n}}\n\n"
+        "Question: {question}"
+    )
 )
 
 if "messages" not in st.session_state:
@@ -84,17 +71,54 @@ question = st.text_area(
 
 if st.button("Find my answer"):
     if question:
-        with st.spinner("Generating response..."):
+        with st.spinner("Processing..."):
             st.session_state.messages.append({"role": "user", "content": question})
             st.chat_message("user").write(question)
 
-            st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
+            # Route calculation logic natively
+            router_input = router_prompt.format(question=question)
+            router_response = llm.invoke(router_input).content.strip()
             
-            # Execute safely inside the native LangChain 0.1.14 agent architecture
-            response = assistant_agent.run(question, callbacks=[st_cb])
+            # Clean up potential markdown blocks added by chat models
+            if router_response.startswith("```"):
+                router_response = router_response.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
+                if router_response.startswith("json"):
+                    router_response = router_response[4:].strip()
+
+            try:
+                decision = json.loads(router_response)
+                selected_tool = decision.get("tool", "Direct")
+                tool_input = decision.get("input", question)
+            except Exception:
+                selected_tool = "Direct"
+                tool_input = question
+
+            # 3. Native Tool Execution Block (Bypasses problematic agent frameworks)
+            if selected_tool == "Calculator":
+                st.info("🔄 Invoking Calculator Tool...")
+                try:
+                    tool_output = calculator.run(tool_input)
+                except Exception as e:
+                    tool_output = f"Calculation issue: {str(e)}"
+            elif selected_tool == "Wikipedia":
+                st.info("🔍 Invoking Wikipedia Search Tool...")
+                tool_output = wikipedia_tool.run(tool_input)
+            else:
+                tool_output = "No tool needed."
+
+            # Synthesis prompt to generate final formatted output
+            synthesis_prompt = (
+                f"Answer the user's question clearly and step-by-step.\n"
+                f"User Question: {question}\n"
+                f"Tool Used: {selected_tool}\n"
+                f"Tool Execution Output Context: {tool_output}\n\n"
+                f"Provide a point-wise logical explanation followed by the final answer."
+            )
             
-            st.session_state.messages.append({'role': 'assistant', "content": response})
+            final_response = llm.invoke(synthesis_prompt).content
+            
+            st.session_state.messages.append({'role': 'assistant', "content": final_response})
             st.write('### Response:')
-            st.success(response)
+            st.success(final_response)
     else:
         st.warning("Please enter a question")
