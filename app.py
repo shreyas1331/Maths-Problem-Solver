@@ -3,8 +3,7 @@ from langchain_groq import ChatGroq
 from langchain.chains import LLMMathChain, LLMChain
 from langchain.prompts import PromptTemplate
 from langchain_community.utilities import WikipediaAPIWrapper
-from langchain.agents import Tool
-# FIX: Use the updated community package to avoid deployment deprecation crashes
+from langchain.agents import Tool, initialize_agent, AgentType
 from langchain_community.callbacks import StreamlitCallbackHandler
 
 ## Set up the Streamlit app
@@ -17,48 +16,57 @@ if not groq_api_key:
     st.info("Please add your Groq API key to continue")
     st.stop()
 
-# 1. Main conversational LLM
-llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key)
-
-# 2. Strict math engine with 0 temperature to stop conversational formatting
-llm_math_engine = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key, temperature=0.0)
+# 1. Initialize models with zero-temperature fallback to enforce deterministic tool routing
+llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key, temperature=0.0)
 
 ## Initializing the tools
 wikipedia_wrapper = WikipediaAPIWrapper()
 wikipedia_tool = Tool(
     name="Wikipedia",
     func=wikipedia_wrapper.run,
-    description="A tool for searching the Internet to find various information on the topics mentioned."
+    description="Useful for searching the Internet to find general information on non-mathematical topics."
 )
 
-math_chain = LLMMathChain.from_llm(llm=llm_math_engine)
+# 2. Fix the LLMMathChain output format conflict natively using an explicit internal prompt override
+custom_math_prompt = PromptTemplate(
+    input_variables=["question"],
+    template=(
+        "Translate this math problem into a clean Python expression that runs with the numexpr library. "
+        "Do not write text, introductions, markdown or explanations. Return ONLY the code format required.\n"
+        "Question: {question}\n"
+        "```python\n"
+    )
+)
+
+math_chain = LLMMathChain.from_llm(llm=llm, prompt=custom_math_prompt)
 calculator = Tool(
     name="Calculator",
     func=math_chain.run,
-    description="A tool for answering math-related questions. Only raw mathematical expressions should be passed to this tool (e.g., (5-2)+(7-3))."
+    description="Useful for evaluating arithmetic, numeric or equations expressions. Pass only raw expressions (e.g. 8-2)."
 )
 
-prompt = """
-You are an expert agent tasked with solving a user's question. 
-Break down the problem logically, show your steps clearly, use tools if necessary, and provide a clear final answer.
+# 3. Create a logic block to isolate word problems from simple tool execution loops
+prompt_text = "Solve this multi-step logic text reasoning query clearly step-by-step: {question}"
+prompt_template = PromptTemplate(input_variables=["question"], template=prompt_text)
+chain = LLMChain(llm=llm, prompt=prompt_template)
 
-Question: {question}
-Answer:
-"""
-
-prompt_template = PromptTemplate(
-    input_variables=["question"],
-    template=prompt
+reasoning_tool = Tool(
+    name="Reasoning_Tool",
+    func=chain.run,
+    description="Useful for breaking down raw textual word math problems, counting scenarios, or logic questions."
 )
 
-# 3. Dedicated tool binding configuration
-# Automatically routes complex queries into a structured tool pipeline natively
-tools_map = {
-    "wikipedia": wikipedia_tool,
-    "calculator": calculator
-}
+tools = [wikipedia_tool, calculator, reasoning_tool]
 
-llm_with_tools = llm.bind_tools([wikipedia_tool, calculator])
+# 4. Use STRUCTURED_CHAT agent type to prevent standard text loop parsing errors in LangChain 0.1.14
+assistant_agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True,
+    handle_parsing_errors=True,
+    max_iterations=5  # Strict iteration fallback boundary
+)
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = [
@@ -68,7 +76,7 @@ if "messages" not in st.session_state:
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg['content'])
 
-## Let's start the interaction
+## Interaction Input UI
 question = st.text_area(
     "Enter your question:",
     value="If I have 8 bananas and 2 I have given to someone then how much are left with me"
@@ -82,29 +90,8 @@ if st.button("Find my answer"):
 
             st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
             
-            # 4. Native Engine Invocation
-            # Queries the model directly with tools to execute calculations with zero parsing loops
-            ai_msg = llm_with_tools.invoke(question, callbacks=[st_cb])
-            
-            # If the model requests a tool call, handle it natively
-            if ai_msg.tool_calls:
-                tool_call = ai_msg.tool_calls[0]
-                tool_name = tool_call["name"].lower()
-                tool_args = tool_call["args"]
-                
-                # Extract clean string arguments for execution
-                query_arg = list(tool_args.values())[0] if tool_args else question
-                
-                if "calc" in tool_name or "math" in tool_name:
-                    result = calculator.run(query_arg)
-                else:
-                    result = wikipedia_tool.run(query_arg)
-                
-                # Combine original reasoning with tool output for final synthesis
-                final_prompt = f"Based on the tool result: '{result}', solve the user question: '{question}'"
-                response = llm.invoke(final_prompt).content
-            else:
-                response = ai_msg.content
+            # Execute safely inside the native LangChain 0.1.14 agent architecture
+            response = assistant_agent.run(question, callbacks=[st_cb])
             
             st.session_state.messages.append({'role': 'assistant', "content": response})
             st.write('### Response:')
